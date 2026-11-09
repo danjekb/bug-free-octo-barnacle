@@ -1,0 +1,250 @@
+name: Game Assistant APK Patcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: Direct HTTPS download URL for the original Game Assistant APK
+        required: true
+        type: string
+      gt:
+        description: Enable GT Mode patch
+        required: false
+        default: true
+        type: boolean
+      caps:
+        description: Enable display/image capability patches (OSR, SR, HDR/EDR, AI tool, MEMC)
+        required: false
+        default: true
+        type: boolean
+      four_d:
+        description: Enable 4D vibration patches
+        required: false
+        default: false
+        type: boolean
+      ping:
+        description: Replace Baidu ping targets with Google targets
+        required: false
+        default: false
+        type: boolean
+      tile:
+        description: Enable the System Usage tile patch (less certain)
+        required: false
+        default: false
+        type: boolean
+      feat:
+        description: Enable additional software feature flags
+        required: false
+        default: false
+        type: boolean
+      export:
+        description: Force export flag off (may affect region-dependent services/content)
+        required: false
+        default: false
+        type: boolean
+      risky:
+        description: Allow the optional cache-check patch
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: Only decompile and report patch matches; do not build/sign an APK
+        required: false
+        default: false
+        type: boolean
+      allow_partial:
+        description: Continue to build if some required patch targets are missing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: game-assistant-patcher-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    name: Decompile, patch, build and sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build Tools
+        run: sdkmanager "build-tools;35.0.0"
+
+      - name: Download Apktool
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar \
+            -o "$RUNNER_TEMP/apktool.jar"
+          test -s "$RUNNER_TEMP/apktool.jar"
+
+      - name: Download input APK
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p input output logs
+          case "$APK_URL" in https://*) ;; *) echo "Only HTTPS APK URLs are accepted." >&2; exit 1 ;; esac
+          curl --fail --location --show-error --silent --retry 3 --retry-delay 2 \
+            --connect-timeout 20 --max-time 600 "$APK_URL" -o input/Game_Assistant.apk
+          test -s input/Game_Assistant.apk
+          file input/Game_Assistant.apk | tee logs/input-file.txt
+          if ! file input/Game_Assistant.apk | grep -qi 'zip archive\|android package'; then
+            echo "Downloaded file does not look like an APK/ZIP archive." >&2
+            exit 1
+          fi
+
+      - name: Decompile APK
+        run: |
+          set -euo pipefail
+          java -jar "$RUNNER_TEMP/apktool.jar" d -f -r \
+            -o work/dec input/Game_Assistant.apk 2>&1 | tee logs/decompile.log
+
+      - name: Apply selected patches
+        id: patch
+        env:
+          INPUT_GT: ${{ inputs.gt }}
+          INPUT_CAPS: ${{ inputs.caps }}
+          INPUT_4D: ${{ inputs.four_d }}
+          INPUT_PING: ${{ inputs.ping }}
+          INPUT_TILE: ${{ inputs.tile }}
+          INPUT_FEAT: ${{ inputs.feat }}
+          INPUT_EXPORT: ${{ inputs.export }}
+          INPUT_RISKY: ${{ inputs.risky }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          ALLOW_PARTIAL: ${{ inputs.allow_partial }}
+        run: |
+          set -euo pipefail
+          args=(work/dec)
+          [[ "$INPUT_GT" == "true" ]] && args+=(--gt)
+          [[ "$INPUT_CAPS" == "true" ]] && args+=(--caps)
+          [[ "$INPUT_4D" == "true" ]] && args+=(--4d)
+          [[ "$INPUT_PING" == "true" ]] && args+=(--ping)
+          [[ "$INPUT_TILE" == "true" ]] && args+=(--tile)
+          [[ "$INPUT_FEAT" == "true" ]] && args+=(--feat)
+          [[ "$INPUT_EXPORT" == "true" ]] && args+=(--export)
+          [[ "$INPUT_RISKY" == "true" ]] && args+=(--risky)
+          [[ "$INPUT_DRY_RUN" == "true" ]] && args+=(--dry-run)
+
+          printf 'Selected patcher arguments:' | tee logs/patch-options.txt
+          printf ' %q' "${args[@]:1}" | tee -a logs/patch-options.txt
+          printf '\n' | tee -a logs/patch-options.txt
+
+          set +e
+          python3 patch_game_assistant.py "${args[@]}" 2>&1 | tee logs/patch.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+
+          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+            echo "Dry-run requested; build and signing will be skipped."
+            exit 0
+          fi
+          if [[ "$rc" -ne 0 && "$ALLOW_PARTIAL" != "true" ]]; then
+            echo "Patcher reported missing/ambiguous required targets (exit $rc). Enable allow_partial only after reviewing patch.log." >&2
+            exit "$rc"
+          fi
+          if [[ "$rc" -ne 0 ]]; then
+            echo "WARNING: continuing with partial patch results because allow_partial=true."
+          fi
+
+      - name: Build APK
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if ! java -jar "$RUNNER_TEMP/apktool.jar" b -f work/dec -o output/unsigned.apk > logs/build.log 2>&1; then
+            echo "First build failed; retrying with one thread."
+            if ! java -jar "$RUNNER_TEMP/apktool.jar" b -f -j 1 work/dec -o output/unsigned.apk >> logs/build.log 2>&1; then
+              tail -n 100 logs/build.log
+              exit 1
+            fi
+          fi
+          test -s output/unsigned.apk
+
+      - name: Align APK
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="${ANDROID_HOME}/build-tools/35.0.0"
+          "$BUILD_TOOLS/zipalign" -f -p 4 output/unsigned.apk output/aligned.apk
+          "$BUILD_TOOLS/zipalign" -c -v 4 output/aligned.apk | tee logs/zipalign.log
+
+      - name: Sign APK
+        if: ${{ !inputs.dry_run }}
+        env:
+          GA_KEYSTORE_BASE64: ${{ secrets.GA_KEYSTORE_BASE64 }}
+          GA_KEYSTORE_PASSWORD: ${{ secrets.GA_KEYSTORE_PASSWORD }}
+          GA_KEY_ALIAS: ${{ secrets.GA_KEY_ALIAS }}
+          GA_KEY_PASSWORD: ${{ secrets.GA_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="${ANDROID_HOME}/build-tools/35.0.0"
+          if [[ -n "$GA_KEYSTORE_BASE64" ]]; then
+            : "${GA_KEYSTORE_PASSWORD:?GA_KEYSTORE_PASSWORD is required with GA_KEYSTORE_BASE64}"
+            : "${GA_KEY_ALIAS:?GA_KEY_ALIAS is required with GA_KEYSTORE_BASE64}"
+            KEY_PASSWORD="${GA_KEY_PASSWORD:-$GA_KEYSTORE_PASSWORD}"
+            printf '%s' "$GA_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/ga-signing.keystore"
+            STORE_PASSWORD="$GA_KEYSTORE_PASSWORD"
+            ALIAS="$GA_KEY_ALIAS"
+            echo "Using repository-provided signing keystore."
+          else
+            echo "::warning::No signing secrets configured. Generating an ephemeral key; this APK will not share an update signature with future runs."
+            keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/ga-signing.keystore" \
+              -storepass temp-pass-please-change -keypass temp-pass-please-change \
+              -alias ga-patcher -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Game Assistant Patcher, O=Local Build, C=PL"
+            STORE_PASSWORD="temp-pass-please-change"
+            KEY_PASSWORD="temp-pass-please-change"
+            ALIAS="ga-patcher"
+          fi
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$RUNNER_TEMP/ga-signing.keystore" \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --out output/Game_Assistant_MOD.apk output/aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs output/Game_Assistant_MOD.apk \
+            2>&1 | tee logs/signature-verification.log
+          sha256sum output/Game_Assistant_MOD.apk | tee logs/SHA256SUMS.txt
+
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            echo "## Game Assistant patch run"
+            echo
+            echo "- Source: supplied HTTPS APK URL"
+            echo "- Dry run: ${{ inputs.dry_run }}"
+            echo "- Patch groups: GT=${{ inputs.gt }}, CAPS=${{ inputs.caps }}, 4D=${{ inputs.four_d }}, PING=${{ inputs.ping }}, TILE=${{ inputs.tile }}, FEAT=${{ inputs.feat }}, EXPORT=${{ inputs.export }}"
+            echo
+            echo "Review patch.log for every applied, skipped, or missing target. A successful build does not guarantee that the device implements the advertised hardware feature."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-assistant-patcher-${{ github.run_number }}
+          path: |
+            output/Game_Assistant_MOD.apk
+            logs/
+          if-no-files-found: warn
+          retention-days: 14
+          
