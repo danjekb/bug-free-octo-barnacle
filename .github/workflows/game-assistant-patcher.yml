@@ -82,6 +82,8 @@ jobs:
 
       - name: Set up Android SDK tools
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install Android Build Tools
         run: sdkmanager "build-tools;35.0.0"
